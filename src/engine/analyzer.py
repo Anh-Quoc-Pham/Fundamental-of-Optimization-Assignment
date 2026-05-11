@@ -110,7 +110,8 @@ class InventoryAnalyzer:
         sales_metrics["quantity_cv"] = (
             sales_metrics["quantity_std"] / sales_metrics["quantity_mean"]
         )
-        sales_metrics["quantity_cv"].fillna(0, inplace=True)
+        # Fix: avoid chained-assignment FutureWarning
+        sales_metrics["quantity_cv"] = sales_metrics["quantity_cv"].fillna(0)
 
         # Calculate days since last sale
         last_sale_date = (
@@ -125,6 +126,22 @@ class InventoryAnalyzer:
             end_date - last_sale_date["last_sale_date"]
         ).dt.days
 
+        # ----------------------------------------------------------------
+        # Compute avg_daily_sales = total_quantity / calendar_days
+        # calendar_days = (max_date - min_date).days + 1  over the whole
+        # dataset, so all (store, product) pairs share the same denominator.
+        # This is the correct formula for Days of Supply (DoS):
+        #   DoS = current_stock / avg_daily_sales
+        # Previously the code used quantity_mean (per-transaction average)
+        # which underestimates daily sales for products sold infrequently.
+        # ----------------------------------------------------------------
+        min_date = self.sales_df["date"].min()
+        calendar_days = max((end_date - min_date).days + 1, 1)  # at least 1
+
+        sales_metrics["avg_daily_sales"] = (
+            sales_metrics["quantity_sum"] / calendar_days
+        )
+
         # Merge metrics with inventory data
         analysis_df = pd.merge(
             self.inventory_df, sales_metrics, on=["store_id", "product_id"], how="left"
@@ -133,7 +150,7 @@ class InventoryAnalyzer:
             analysis_df, last_sale_date, on=["store_id", "product_id"], how="left"
         )
 
-        # Fill NaN values for products with no sales
+        # Fill NaN values for products with no sales (fix chained-assignment warnings)
         for col in [
             "quantity_sum",
             "quantity_mean",
@@ -142,19 +159,18 @@ class InventoryAnalyzer:
             "revenue_sum",
             "revenue_mean",
             "quantity_cv",
+            "avg_daily_sales",
         ]:
-            analysis_df[col].fillna(0, inplace=True)
+            analysis_df[col] = analysis_df[col].fillna(0)
 
-        # Calculate days of inventory based on average daily sales
-        # Use the mean quantity per sale (matches data generator logic)
-        analysis_df["avg_daily_sales"] = analysis_df["quantity_mean"]
-        analysis_df["avg_daily_sales"].replace(
-            0, 0.01, inplace=True
-        )  # Avoid division by zero
-
-        analysis_df["days_of_inventory"] = (
-            analysis_df["current_stock"] / analysis_df["avg_daily_sales"]
-        )
+        # Days of Supply: DoS = current_stock / avg_daily_sales
+        # If avg_daily_sales == 0 and current_stock > 0, the item has never
+        # been sold → treat as slow-mover / excess candidate by setting DoS
+        # to a large sentinel (9999 days) rather than inf, for numeric stability.
+        dos = analysis_df["current_stock"] / analysis_df["avg_daily_sales"].replace(0, np.nan)
+        analysis_df["avg_daily_sales"] = analysis_df["avg_daily_sales"]  # keep 0 for display
+        # Sentinel for zero-sales items: 9999 days → classified as Excess if stock > 0
+        analysis_df["days_of_inventory"] = dos.fillna(9999)
 
         # Add city information if available
         if isinstance(self.stores, pd.DataFrame):
@@ -302,12 +318,11 @@ class InventoryAnalyzer:
         post_analysis["current_stock"] = post_inventory["current_stock"]
 
         # Calculate days of inventory based on average daily sales
+        # Use same safe division as analyze_sales_data: zero avg_daily_sales → 9999 sentinel
+        _safe_ads = post_analysis["avg_daily_sales"].replace(0, np.nan)
         post_analysis["days_of_inventory"] = (
-            post_analysis["current_stock"] / post_analysis["avg_daily_sales"]
-        )
-        post_analysis["days_of_inventory"].replace(
-            np.inf, 365, inplace=True
-        )  # Cap at 1 year for zero sales
+            post_analysis["current_stock"] / _safe_ads
+        ).fillna(9999)  # sentinel: never-sold items remain "excess" candidates
 
         # Identify inventory status after transfers
         min_days = MIN_INVENTORY_DAYS
