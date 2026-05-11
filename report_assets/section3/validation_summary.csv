@@ -1,0 +1,2 @@
+Method,Objective (VND),LP Reference (HiGHS),Absolute Gap,Relative Gap (%),Status
+Transportation Simplex,29101871.08,29101871.0,0.07999999821186066,2.748964085912574e-07,optimal
