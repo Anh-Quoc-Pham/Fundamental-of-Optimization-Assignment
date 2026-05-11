@@ -38,6 +38,7 @@ from src.engine.analyzer import InventoryAnalyzer
 from src.engine.genetic_algorithm import GeneticAlgorithmOptimizer
 from src.engine.results_manager import ResultsManager
 from src.engine.rule_based import RuleBasedOptimizer
+from src.engine.transportation_simplex import TransportationSimplexOptimizer
 
 
 def setup_directories():
@@ -202,17 +203,149 @@ def run_ga_optimization(analyzer, excess_df, needed_df, args):
     return transfer_plan, None
 
 
+def run_transportation_simplex_optimization(analyzer, excess_df, needed_df, args):
+    """Run Transportation Simplex optimization (main academic solver)."""
+    print("\n=== TRANSPORTATION SIMPLEX OPTIMIZATION ===")
+
+    optimizer = TransportationSimplexOptimizer()
+    optimizer.load_matrices(
+        distance_path=os.path.join(args.data_dir, "distance_matrix.csv"),
+        cost_path=os.path.join(args.data_dir, "transport_cost_matrix.csv"),
+    )
+
+    start_time = time.time()
+    transfer_plan = optimizer.optimize(excess_df, needed_df)
+    execution_time = time.time() - start_time
+    print(f"Transportation Simplex completed in {execution_time:.2f} seconds")
+
+    stores_df = pd.read_csv(os.path.join(args.data_dir, "stores.csv"))
+    products_df = pd.read_csv(os.path.join(args.data_dir, "products.csv"))
+    optimizer.add_store_product_names(stores_df, products_df)
+
+    if not transfer_plan.empty:
+        transfer_plan.to_csv(
+            os.path.join(args.results_dir, "transportation_simplex_transfers.csv"),
+            index=False,
+        )
+        impact_df, _ = analyzer.evaluate_plan_impact(transfer_plan)
+        pd.DataFrame(impact_df).to_csv(
+            os.path.join(args.results_dir, "transportation_simplex_impact.csv")
+        )
+        return transfer_plan, impact_df, optimizer, execution_time
+
+    return transfer_plan, None, optimizer, execution_time
+
+
 def create_results(analysis_df, results_dict, analyzer, args):
     """Create simplified results: summary and best transfer plan."""
     print("\n=== GENERATING RESULTS ===")
 
-    # Load store and product data
     stores_df = pd.read_csv(os.path.join(args.data_dir, "stores.csv"))
     products_df = pd.read_csv(os.path.join(args.data_dir, "products.csv"))
 
-    # Create results manager and generate final results
     results_manager = ResultsManager(args.results_dir)
-    results_manager.create_final_results(results_dict, stores_df, products_df)
+    # results_dict values may be 2-tuples (plan, impact) or 3/4-tuples;
+    # ResultsManager expects {name: (plan, impact)}
+    slim_dict = {
+        k: (v[0], v[1]) for k, v in results_dict.items()
+    }
+    results_manager.create_final_results(slim_dict, stores_df, products_df)
+
+
+def _coverage_rate(transfer_plan: pd.DataFrame, needed_df: pd.DataFrame):
+    """
+    Compute coverage KPIs correctly:
+      covered_units = sum over each (to_store_id, product_id) of
+                      min(received_units, needed_units)
+      coverage_rate = covered_units / total_needed_units * 100
+    """
+    total_needed = int(needed_df["needed_units"].sum())
+    if total_needed == 0:
+        return 0, 100.0, 0
+
+    if transfer_plan is None or transfer_plan.empty:
+        return 0, 0.0, total_needed
+
+    received = (
+        transfer_plan.groupby(["to_store_id", "product_id"])["units"]
+        .sum()
+        .reset_index()
+        .rename(columns={"units": "received_units"})
+    )
+    merged = needed_df[["store_id", "product_id", "needed_units"]].merge(
+        received,
+        left_on=["store_id", "product_id"],
+        right_on=["to_store_id", "product_id"],
+        how="left",
+    )
+    merged["received_units"] = merged["received_units"].fillna(0)
+    merged["covered"] = merged[["received_units", "needed_units"]].min(axis=1)
+    covered = int(merged["covered"].sum())
+    unmet = total_needed - covered
+    rate = covered / total_needed * 100
+    return covered, round(rate, 2), unmet
+
+
+def create_algorithm_comparison(
+    results_dict: dict,
+    needed_df: pd.DataFrame,
+    results_dir: str,
+):
+    """
+    Write results/algorithm_comparison.csv comparing all algorithms.
+
+    results_dict: {algorithm_name: (transfer_plan, impact_df, optimizer, exec_time)}
+    The 3rd and 4th elements are optional (may be None).
+    """
+    rows = []
+    total_needed = int(needed_df["needed_units"].sum())
+
+    for algo, vals in results_dict.items():
+        plan = vals[0]
+        exec_time = vals[3] if len(vals) > 3 else None
+        optimizer = vals[2] if len(vals) > 2 else None
+
+        covered, rate, unmet = _coverage_rate(plan, needed_df)
+
+        if plan is not None and not plan.empty:
+            total_cost = plan["transport_cost"].sum()
+            n_transfers = len(plan)
+            total_units = int(plan["units"].sum())
+            avg_cost = total_cost / total_units if total_units > 0 else 0
+        else:
+            total_cost = n_transfers = total_units = avg_cost = 0
+
+        # Iteration / status from TS solver stats
+        solver_status = "N/A"
+        iterations = "N/A"
+        if optimizer is not None and hasattr(optimizer, "solver_stats"):
+            stats = optimizer.solver_stats.get("per_product", [])
+            if stats:
+                statuses = [s["status"] for s in stats]
+                solver_status = "optimal" if all(s == "optimal" for s in statuses) else "mixed"
+                iterations = sum(s["iterations"] for s in stats)
+
+        rows.append({
+            "algorithm": algo,
+            "total_transport_cost": round(total_cost, 2),
+            "number_of_transfers": n_transfers,
+            "total_units_transferred": total_units,
+            "covered_units": covered,
+            "total_needed_units": total_needed,
+            "coverage_rate": rate,
+            "unmet_units": unmet,
+            "avg_cost_per_unit": round(avg_cost, 2),
+            "execution_time_seconds": round(exec_time, 3) if exec_time else None,
+            "solver_status": solver_status,
+            "iterations": iterations,
+        })
+
+    cmp_df = pd.DataFrame(rows)
+    out_path = os.path.join(results_dir, "algorithm_comparison.csv")
+    cmp_df.to_csv(out_path, index=False)
+    print(f"\nAlgorithm comparison saved to {out_path}")
+    print(cmp_df.to_string(index=False))
+    return cmp_df
 
 
 def main():
@@ -276,7 +409,18 @@ def main():
         "--ga", action="store_true", help="Run genetic algorithm optimization"
     )
     parser.add_argument(
-        "--all", action="store_true", help="Run all optimization methods"
+        "--transportation-simplex", "--ts",
+        dest="transportation_simplex",
+        action="store_true",
+        help="Run Transportation Simplex (main academic solver)",
+    )
+    parser.add_argument(
+        "--all", action="store_true",
+        help="Run Rule-Based, Transportation Simplex, and GA (GA is slow ~7 min)",
+    )
+    parser.add_argument(
+        "--validate", action="store_true",
+        help="After TS, validate objective with scipy linprog",
     )
 
     # Genetic algorithm options
@@ -334,29 +478,45 @@ def main():
     # Run analysis
     analyzer, analysis_df, excess_df, needed_df = run_analysis(args)
 
-    # Run optimizations
+    # Run optimizations -- results_dict: {name: (plan, impact, optimizer_or_None, exec_time)}
     results_dict = {}
 
     if args.rule_based or args.all:
+        t0 = time.time()
         transfer_plan, impact_df = run_rule_based_optimization(
             analyzer, excess_df, needed_df, args
         )
-        results_dict["Rule-Based"] = (transfer_plan, impact_df)
+        results_dict["Rule-Based"] = (transfer_plan, impact_df, None, time.time() - t0)
+
+    if args.transportation_simplex or args.all:
+        plan, impact, optimizer, exec_time = run_transportation_simplex_optimization(
+            analyzer, excess_df, needed_df, args
+        )
+        results_dict["Transportation-Simplex"] = (plan, impact, optimizer, exec_time)
+        if getattr(args, "validate", False) and optimizer is not None:
+            optimizer._validate_with_linprog(excess_df, needed_df)
 
     if args.ga or args.all:
+        print("\n[NOTE] GA is slow (~7-8 min). Use --rule-based --ts to skip GA.")
+        t0 = time.time()
         transfer_plan, impact_df = run_ga_optimization(
             analyzer, excess_df, needed_df, args
         )
-        results_dict["Genetic Algorithm"] = (transfer_plan, impact_df)
+        results_dict["Genetic-Algorithm"] = (transfer_plan, impact_df, None, time.time() - t0)
 
     # Create comprehensive results and reports
     if results_dict:
         create_results(analysis_df, results_dict, analyzer, args)
+        create_algorithm_comparison(results_dict, needed_df, args.results_dir)
 
     print("\n=== INVENTORY TRANSFER OPTIMIZATION COMPLETE ===")
     print(f"Results saved to {args.results_dir} directory:")
-    print(f"  • result_summary.txt - Algorithm comparison and recommendations")
-    print(f"  • best_transfer_plan.csv - Optimized transfer plan")
+    print(f"  * result_summary.txt          - Algorithm comparison")
+    print(f"  * best_transfer_plan.csv       - Best algorithm plan")
+    print(f"  * algorithm_comparison.csv     - Full KPI comparison table")
+    if getattr(args, "transportation_simplex", False) or getattr(args, "all", False):
+        print(f"  * transportation_simplex_transfers.csv")
+        print(f"  * transportation_simplex_impact.csv")
 
 
 if __name__ == "__main__":
